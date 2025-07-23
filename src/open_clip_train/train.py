@@ -8,7 +8,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.nn.parallel.distributed import DistributedDataParallel
-
+from contextlib import nullcontext
 try:
     import wandb
 except ImportError:
@@ -121,7 +121,7 @@ def train_one_epoch(model, data, loss, epoch, optimizers, scaler, scheduler, dis
                 ) / 2
             
             # Prevent DDP sync for the adversary's backward pass
-            no_sync_context = model.no_sync if args.distributed else lambda: torch.no_grad()
+            no_sync_context = model.no_sync if args.distributed else nullcontext
             with no_sync_context():
                 backward(adversary_loss, scaler)
 

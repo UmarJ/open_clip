@@ -107,7 +107,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
                 adversary_loss = None
                 fooling_loss = None
-                if hasattr(args, 'use_adversary') and args.use_adversary:
+                if args.use_adversary:
                     adversary = unwrap_model(model).adversary
                     if adversary is not None:
                         image_features = model_out["image_features"]
@@ -136,8 +136,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
                 total_loss = sum(losses.values())
                 if adversary_loss is not None and fooling_loss is not None:
-                    if not hasattr(args, 'adversarial_loss_weight'):
-                        args.adversarial_loss_weight = 1.0
                     losses['adversary_loss'] = adversary_loss
                     losses['fooling_loss'] = fooling_loss
                     total_loss += adversary_loss + args.adversarial_loss_weight * fooling_loss
@@ -179,7 +177,7 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     
                     adversary_loss = None
                     fooling_loss = None
-                    if hasattr(args, 'use_adversary') and args.use_adversary:
+                    if args.use_adversary:
                         adversary = unwrap_model(model).adversary
                         if adversary is not None:
                             logging.info('THE ADVERSARY NOT NONE')
@@ -224,8 +222,6 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
 
                     total_loss = sum(losses.values())
                     if adversary_loss is not None and fooling_loss is not None:
-                        if not hasattr(args, 'adversarial_loss_weight'):
-                            args.adversarial_loss_weight = 1.0
                         losses['adversary_loss'] = adversary_loss
                         losses['fooling_loss'] = fooling_loss
                         total_loss += adversary_loss + args.adversarial_loss_weight * fooling_loss
@@ -373,7 +369,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
 
                     gen_loss = maybe_compute_generative_loss(model_out)
 
-                    if hasattr(args, 'use_adversary') and args.use_adversary and unwrap_model(model).adversary is not None:
+                    if args.use_adversary and unwrap_model(model).adversary is not None:
                         adversary = unwrap_model(model).adversary
                         pred_from_img = adversary(image_features).squeeze(-1)
                         pred_from_text = adversary(text_features).squeeze(-1)
@@ -420,7 +416,7 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
                 gen_loss = cumulative_gen_loss / num_samples
                 metrics.update({"val_generative_loss": gen_loss.item()})
 
-            if hasattr(args, 'use_adversary') and args.use_adversary and unwrap_model(model).adversary is not None:
+            if args.use_adversary and unwrap_model(model).adversary is not None:
                 adversary_val_loss = cumulative_adversary_loss / num_samples
                 adversary_accuracy = total_adversary_correct / (2 * num_samples)
                 metrics.update({

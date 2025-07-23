@@ -96,18 +96,19 @@ def train_one_epoch(model, data, loss, epoch, optimizers, scaler, scheduler, dis
         data_time_m.update(time.time() - end)
 
         if args.use_adversary:
-            optimizers['main'].zero_grad()
             optimizers['adversary'].zero_grad()
+            optimizers['main'].zero_grad()
             
+            # Step A: Train Adversary
+            # The forward pass is done once and the features are used for both updates.
             with autocast():
                 model_out = model(images, texts)
                 image_features = model_out["image_features"]
                 text_features = model_out["text_features"]
                 logit_scale = model_out["logit_scale"]
-
+                
                 adversary = unwrap_model(model).adversary
                 
-                # Step A: Train Adversary
                 pred_from_img = adversary(image_features.detach()).squeeze(-1)
                 pred_from_text = adversary(text_features.detach()).squeeze(-1)
                 
@@ -119,17 +120,23 @@ def train_one_epoch(model, data, loss, epoch, optimizers, scaler, scheduler, dis
                     F.binary_cross_entropy_with_logits(pred_from_text, labels_text)
                 ) / 2
             
-            backward(adversary_loss, scaler)
+            # Prevent DDP sync for the adversary's backward pass
+            no_sync_context = model.no_sync if args.distributed else lambda: torch.no_grad()
+            with no_sync_context():
+                backward(adversary_loss, scaler)
+
             if scaler is not None:
                 scaler.step(optimizers['adversary'])
             else:
                 optimizers['adversary'].step()
 
-            # Step B: Train Main Model
+            # Step B: Train Main Model (Generator)
             with autocast():
+                # Re-use features from the initial forward pass
                 pred_from_img_fool = adversary(image_features).squeeze(-1)
                 pred_from_text_fool = adversary(text_features).squeeze(-1)
 
+                # Fooling loss wants the adversary to predict the opposite labels
                 fooling_loss = (
                     F.binary_cross_entropy_with_logits(pred_from_img_fool, labels_text) +
                     F.binary_cross_entropy_with_logits(pred_from_text_fool, labels_img)
@@ -140,19 +147,27 @@ def train_one_epoch(model, data, loss, epoch, optimizers, scaler, scheduler, dis
 
                 total_main_loss = contrastive_loss + args.adversarial_loss_weight * fooling_loss
                 
+                # For logging
                 losses['adversary_loss'] = adversary_loss
                 losses['fooling_loss'] = fooling_loss
                 losses['loss'] = total_main_loss + adversary_loss
-            
+
+            # This backward pass will sync gradients for the main model
             backward(total_main_loss, scaler)
             if scaler is not None:
                 if args.grad_clip_norm is not None:
                     scaler.unscale_(optimizers['main'])
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for n, p in model.named_parameters() if 'adversary' not in n], 
+                        args.grad_clip_norm, norm_type=2.0
+                    )
                 scaler.step(optimizers['main'])
             else:
                 if args.grad_clip_norm is not None:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for n, p in model.named_parameters() if 'adversary' not in n], 
+                        args.grad_clip_norm, norm_type=2.0
+                    )
                 optimizers['main'].step()
             
             if scaler is not None:

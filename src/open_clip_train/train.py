@@ -61,7 +61,7 @@ def backward(total_loss, scaler):
         total_loss.backward()
 
 
-def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist_model, args, tb_writer=None):
+def train_one_epoch(model, data, loss, epoch, optimizers, scaler, scheduler, dist_model, args, tb_writer=None):
     device = torch.device(args.device)
     autocast = get_autocast(args.precision, device_type=device.type)
     input_dtype = get_input_dtype(args.precision)
@@ -69,14 +69,14 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
     model.train()
     if args.distill:
         dist_model.eval()
+    
+    if args.use_adversary:
+        assert args.accum_freq == 1, "Adversarial training does not support gradient accumulation."
 
     data['train'].set_epoch(epoch)  # set epoch in process safe manner via sampler or shared_epoch
     dataloader = data['train'].dataloader
     num_batches_per_epoch = dataloader.num_batches // args.accum_freq
     sample_digits = math.ceil(math.log(dataloader.num_samples + 1, 10))
-
-    if args.accum_freq > 1:
-        accum_images, accum_texts, accum_features = [], [], {}
 
     losses_m = {}
     batch_time_m = AverageMeter()
@@ -94,9 +94,72 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
         texts = texts.to(device=device, non_blocking=True)
 
         data_time_m.update(time.time() - end)
-        optimizer.zero_grad()
 
-        if args.accum_freq == 1:
+        if args.use_adversary:
+            optimizers['main'].zero_grad()
+            optimizers['adversary'].zero_grad()
+            
+            with autocast():
+                model_out = model(images, texts)
+                image_features = model_out["image_features"]
+                text_features = model_out["text_features"]
+                logit_scale = model_out["logit_scale"]
+
+                adversary = unwrap_model(model).adversary
+                
+                # Step A: Train Adversary
+                pred_from_img = adversary(image_features.detach()).squeeze(-1)
+                pred_from_text = adversary(text_features.detach()).squeeze(-1)
+                
+                labels_img = torch.ones_like(pred_from_img)
+                labels_text = torch.zeros_like(pred_from_text)
+                
+                adversary_loss = (
+                    F.binary_cross_entropy_with_logits(pred_from_img, labels_img) +
+                    F.binary_cross_entropy_with_logits(pred_from_text, labels_text)
+                ) / 2
+            
+            backward(adversary_loss, scaler)
+            if scaler is not None:
+                scaler.step(optimizers['adversary'])
+            else:
+                optimizers['adversary'].step()
+
+            # Step B: Train Main Model
+            with autocast():
+                pred_from_img_fool = adversary(image_features).squeeze(-1)
+                pred_from_text_fool = adversary(text_features).squeeze(-1)
+
+                fooling_loss = (
+                    F.binary_cross_entropy_with_logits(pred_from_img_fool, labels_text) +
+                    F.binary_cross_entropy_with_logits(pred_from_text_fool, labels_img)
+                ) / 2
+                
+                losses = loss(**model_out, output_dict=True)
+                contrastive_loss = sum(losses.values())
+
+                total_main_loss = contrastive_loss + args.adversarial_loss_weight * fooling_loss
+                
+                losses['adversary_loss'] = adversary_loss
+                losses['fooling_loss'] = fooling_loss
+                losses['loss'] = total_main_loss + adversary_loss
+            
+            backward(total_main_loss, scaler)
+            if scaler is not None:
+                if args.grad_clip_norm is not None:
+                    scaler.unscale_(optimizers['main'])
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                scaler.step(optimizers['main'])
+            else:
+                if args.grad_clip_norm is not None:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
+                optimizers['main'].step()
+            
+            if scaler is not None:
+                scaler.update()
+
+        else: # Original non-adversarial path
+            optimizers['main'].zero_grad()
             with autocast():
                 model_out = model(images, texts)
                 logit_scale = model_out["logit_scale"]
@@ -104,153 +167,21 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     with torch.no_grad():
                         dist_model_out = dist_model(images, texts)
                     model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
-
-                adversary_loss = None
-                fooling_loss = None
-                if args.use_adversary:
-                    adversary = unwrap_model(model).adversary
-                    if adversary is not None:
-                        logging.info('THE ADVERSARY NOT NONE')
-                        image_features = model_out["image_features"]
-                        text_features = model_out["text_features"]
-                        
-                        pred_from_img = adversary(image_features.detach()).squeeze(-1)
-                        pred_from_text = adversary(text_features.detach()).squeeze(-1)
-                        
-                        labels_img = torch.ones_like(pred_from_img)
-                        labels_text = torch.zeros_like(pred_from_text)
-                        
-                        adversary_loss = (
-                            F.binary_cross_entropy_with_logits(pred_from_img, labels_img) +
-                            F.binary_cross_entropy_with_logits(pred_from_text, labels_text)
-                        ) / 2
-
-                        pred_from_img_fool = adversary(image_features).squeeze(-1)
-                        pred_from_text_fool = adversary(text_features).squeeze(-1)
-
-                        fooling_loss = (
-                            F.binary_cross_entropy_with_logits(pred_from_img_fool, labels_text) +
-                            F.binary_cross_entropy_with_logits(pred_from_text_fool, labels_img)
-                        ) / 2
-                    else:
-                        logging.info('THE ADVERSARY NONE')
-
                 losses = loss(**model_out, output_dict=True)
-
                 total_loss = sum(losses.values())
-                if adversary_loss is not None and fooling_loss is not None:
-                    losses['adversary_loss'] = adversary_loss
-                    losses['fooling_loss'] = fooling_loss
-                    total_loss += adversary_loss + args.adversarial_loss_weight * fooling_loss
                 losses["loss"] = total_loss
-
+            
             backward(total_loss, scaler)
-        else:
-            # First, cache the features without any gradient tracking.
-            with torch.no_grad():
-                with autocast():
-                    model_out = model(images, texts)
-
-                    for f in ("logit_scale", "logit_bias"):
-                        model_out.pop(f, None)
-
-                    for key, val in model_out.items():
-                        if key in accum_features:
-                            accum_features[key].append(val)
-                        else:
-                            accum_features[key] = [val]
-
-                accum_images.append(images)
-                accum_texts.append(texts)
-
-            # If (i + 1) % accum_freq is not zero, move on to the next batch.
-            if ((i + 1) % args.accum_freq) > 0:
-                # FIXME this makes data time logging unreliable when accumulating
-                continue
-
-            # Now, ready to take gradients for the last accum_freq batches.
-            # Re-do the forward pass for those batches, and use the cached features from the other batches as negatives.
-            # Call backwards each time, but only step optimizer at the end.
-            optimizer.zero_grad()
-            for j in range(args.accum_freq):
-                images = accum_images[j]
-                texts = accum_texts[j]
-                with autocast():
-                    model_out = model(images, texts)
-                    
-                    adversary_loss = None
-                    fooling_loss = None
-                    if args.use_adversary:
-                        adversary = unwrap_model(model).adversary
-                        if adversary is not None:
-
-                            image_features = model_out["image_features"]
-                            text_features = model_out["text_features"]
-                            
-                            pred_from_img = adversary(image_features.detach()).squeeze(-1)
-                            pred_from_text = adversary(text_features.detach()).squeeze(-1)
-                            
-                            labels_img = torch.ones_like(pred_from_img)
-                            labels_text = torch.zeros_like(pred_from_text)
-                            
-                            adversary_loss = (
-                                F.binary_cross_entropy_with_logits(pred_from_img, labels_img) +
-                                F.binary_cross_entropy_with_logits(pred_from_text, labels_text)
-                            ) / 2
-
-                            pred_from_img_fool = adversary(image_features).squeeze(-1)
-                            pred_from_text_fool = adversary(text_features).squeeze(-1)
-
-                            fooling_loss = (
-                                F.binary_cross_entropy_with_logits(pred_from_img_fool, labels_text) +
-                                F.binary_cross_entropy_with_logits(pred_from_text_fool, labels_img)
-                            ) / 2
-
-                    inputs_no_accum = {}
-                    inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
-                    if "logit_bias" in model_out:
-                        inputs_no_accum["logit_bias"] = model_out.pop("logit_bias")
-
-                    inputs = {}
-                    for key, val in accum_features.items():
-                        accumulated = accum_features[key]
-                        inputs[key] = torch.cat(accumulated[:j] + [model_out[key]] + accumulated[j + 1:])
-
-                    losses = loss(**inputs, **inputs_no_accum, output_dict=True)
-                    del inputs
-                    del inputs_no_accum
-
-                    total_loss = sum(losses.values())
-                    if adversary_loss is not None and fooling_loss is not None:
-                        losses['adversary_loss'] = adversary_loss
-                        losses['fooling_loss'] = fooling_loss
-                        total_loss += adversary_loss + args.adversarial_loss_weight * fooling_loss
-                    losses["loss"] = total_loss
-
-                backward(total_loss, scaler)
-
-        if scaler is not None:
-            if args.horovod:
-                optimizer.synchronize()
-                scaler.unscale_(optimizer)
+            if scaler is not None:
                 if args.grad_clip_norm is not None:
+                    scaler.unscale_(optimizers['main'])
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-                with optimizer.skip_synchronize():
-                    scaler.step(optimizer)
+                scaler.step(optimizers['main'])
+                scaler.update()
             else:
                 if args.grad_clip_norm is not None:
-                    scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-                scaler.step(optimizer)
-            scaler.update()
-        else:
-            if args.grad_clip_norm is not None:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip_norm, norm_type=2.0)
-            optimizer.step()
-
-        # reset gradient accum, if enabled
-        if args.accum_freq > 1:
-            accum_images, accum_texts, accum_features = [], [], {}
+                optimizers['main'].step()
 
         # Note: we clamp to 4.6052 = ln(100), as in the original paper.
         with torch.no_grad():
@@ -278,13 +209,20 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     for loss_name, loss_m in losses_m.items()
                 ]
             )
+            
+            lrs = {f"lr_main": optimizers['main'].param_groups[0]['lr']}
+            if 'adversary' in optimizers:
+                lrs["lr_adv"] = optimizers['adversary'].param_groups[0]['lr']
+            
+            lr_log = " ".join([f"{n}: {v:5f}" for n, v in lrs.items()])
+
             samples_per_second = args.accum_freq * args.batch_size * args.world_size / batch_time_m.val
             samples_per_second_per_gpu = args.accum_freq * args.batch_size / batch_time_m.val
             logging.info(
                 f"Train Epoch: {epoch} [{num_samples:>{sample_digits}}/{samples_per_epoch} ({percent_complete:.0f}%)] "
                 f"Data (t): {data_time_m.avg:.3f} "
                 f"Batch (t): {batch_time_m.avg:.3f}, {samples_per_second:#g}/s, {samples_per_second_per_gpu:#g}/s/gpu "
-                f"LR: {optimizer.param_groups[0]['lr']:5f} "
+                f"{lr_log} "
                 f"Logit Scale: {logit_scale_scalar:.3f} " + loss_log
             )
 
@@ -295,8 +233,8 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 "samples_per_second": samples_per_second,
                 "samples_per_second_per_gpu": samples_per_second_per_gpu,
                 "scale": logit_scale_scalar,
-                "lr": optimizer.param_groups[0]["lr"]
-            }            
+            }
+            log_data.update(lrs)          
             log_data.update({name:val.val for name,val in losses_m.items()})
 
             log_data = {"train/" + name: val for name, val in log_data.items()}

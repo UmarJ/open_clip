@@ -312,67 +312,60 @@ def main(args):
     if args.train_data or args.dataset_type == "synthetic":
         assert not args.trace, 'Cannot train with traced model'
 
-        opt = getattr(args, 'opt', 'adamw').lower()
-        if opt.startswith('timm/'):
-            from timm.optim import create_optimizer_v2
-            timm_opt = opt.split('timm/')[-1]
-            opt_kwargs = {}
-            assert (args.beta1 is None) == (args.beta2 is None), \
-                'When using timm optimizer, BOTH beta1 and beta2 must be specified (or not specified).'
-            if args.beta1 is not None:
-                opt_kwargs['betas'] = (args.beta1, args.beta2)
-            if args.momentum is not None:
-                opt_kwargs['momentum'] = args.momentum
-            optimizer = create_optimizer_v2(
-                model,
-                timm_opt,
-                lr=args.lr,
-                weight_decay=args.wd,
-                eps=args.eps,
-                **opt_kwargs,
-            )
-        else:
-            # If some params are not passed, we use the default values based on model name.
-            exclude = lambda n, p: p.ndim < 2 or "bn" in n or "ln" in n or "bias" in n or 'logit_scale' in n
-            include = lambda n, p: not exclude(n, p)
+        exclude = lambda n, p: p.ndim < 2 or "bn" in n or "ln" in n or "bias" in n or 'logit_scale' in n
+        include = lambda n, p: not exclude(n, p)
 
-            named_parameters = list(model.named_parameters())
+        named_parameters = list(model.named_parameters())
+        
+        if args.use_adversary:
+            main_params = [p for n, p in named_parameters if not 'adversary' in n]
+            adversary_params = [p for n, p in named_parameters if 'adversary' in n]
+            
+            gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and not 'adversary' in n and p.requires_grad]
+            rest_params = [p for n, p in named_parameters if include(n, p) and not 'adversary' in n and p.requires_grad]
+            
+            main_optimizer = optim.AdamW(
+                [
+                    {"params": gain_or_bias_params, "weight_decay": 0.},
+                    {"params": rest_params, "weight_decay": args.wd},
+                ],
+                lr=args.lr,
+                betas=(args.beta1, args.beta2),
+                eps=args.eps,
+            )
+
+            adversary_optimizer = optim.AdamW(
+                adversary_params,
+                lr=args.adversary_lr,
+                betas=(args.beta1, args.beta2),
+                eps=args.eps,
+            )
+            optimizer = {"main": main_optimizer, "adversary": adversary_optimizer}
+        else:
             gain_or_bias_params = [p for n, p in named_parameters if exclude(n, p) and p.requires_grad]
             rest_params = [p for n, p in named_parameters if include(n, p) and p.requires_grad]
-
-            if opt == 'adamw':
-                optimizer = optim.AdamW(
-                    [
-                        {"params": gain_or_bias_params, "weight_decay": 0.},
-                        {"params": rest_params, "weight_decay": args.wd},
-                    ],
-                    lr=args.lr,
-                    betas=(args.beta1, args.beta2),
-                    eps=args.eps,
-                )
-            else:
-                assert False, f'Unknown optimizer {opt}'
-
-        if is_master(args):
-            if is_master(args):
-                defaults = copy.deepcopy(optimizer.defaults)
-                defaults['weight_decay'] = args.wd
-                defaults = ', '.join([f'{k}: {v}' for k, v in defaults.items()])
-                logging.info(
-                    f'Created {type(optimizer).__name__} ({args.opt}) optimizer: {defaults}'
-                )
+            
+            single_optimizer = optim.AdamW(
+                [
+                    {"params": gain_or_bias_params, "weight_decay": 0.},
+                    {"params": rest_params, "weight_decay": args.wd},
+                ],
+                lr=args.lr,
+                betas=(args.beta1, args.beta2),
+                eps=args.eps,
+            )
+            optimizer = {"main": single_optimizer}
 
         if args.horovod:
-            optimizer = hvd.DistributedOptimizer(optimizer, named_parameters=model.named_parameters())
+            # FIXME horovod with two optimizers not supported
+            optimizer = hvd.DistributedOptimizer(optimizer['main'], named_parameters=model.named_parameters())
             hvd.broadcast_parameters(model.state_dict(), root_rank=0)
             hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+            optimizer = {'main': optimizer}
 
         scaler = None
         if args.precision == "amp":
-            try:
-                scaler = torch.amp.GradScaler(device=device)
-            except (AttributeError, TypeError) as e:
-                scaler = torch.cuda.amp.GradScaler()
+            scaler = torch.cuda.amp.GradScaler()
 
     # optionally resume from a checkpoint
     start_epoch = 0
@@ -385,8 +378,14 @@ def main(args):
             if not args.distributed and next(iter(sd.items()))[0].startswith('module'):
                 sd = {k[len('module.'):]: v for k, v in sd.items()}
             model.load_state_dict(sd)
-            if optimizer is not None:
-                optimizer.load_state_dict(checkpoint["optimizer"])
+            if optimizer is not None and 'optimizer' in checkpoint:
+                if args.use_adversary:
+                    if 'main' in checkpoint['optimizer']:
+                         optimizer['main'].load_state_dict(checkpoint['optimizer']['main'])
+                    if 'adversary' in checkpoint['optimizer']:
+                         optimizer['adversary'].load_state_dict(checkpoint['optimizer']['adversary'])
+                else:
+                    optimizer['main'].load_state_dict(checkpoint['optimizer'])
             if scaler is not None and 'scaler' in checkpoint:
                 scaler.load_state_dict(checkpoint['scaler'])
             logging.info(f"=> resuming checkpoint '{args.resume}' (epoch {start_epoch})")
@@ -410,15 +409,15 @@ def main(args):
     if 'train' in data and optimizer is not None:
         total_steps = (data["train"].dataloader.num_batches // args.accum_freq) * args.epochs
         if args.lr_scheduler == "cosine":
-            scheduler = cosine_lr(optimizer, args.lr, args.warmup, total_steps)
+            scheduler = cosine_lr(optimizer['main'], args.lr, args.warmup, total_steps)
         elif args.lr_scheduler == "const":
-            scheduler = const_lr(optimizer, args.lr, args.warmup, total_steps)
+            scheduler = const_lr(optimizer['main'], args.lr, args.warmup, total_steps)
         elif args.lr_scheduler == "const-cooldown":
             assert args.epochs_cooldown is not None,\
                 "Please specify the number of cooldown epochs for this lr schedule."
             cooldown_steps = (data["train"].dataloader.num_batches // args.accum_freq) * args.epochs_cooldown
             scheduler = const_lr_cooldown(
-                optimizer, args.lr, args.warmup, total_steps,
+                optimizer['main'], args.lr, args.warmup, total_steps,
                 cooldown_steps, args.lr_cooldown_power, args.lr_cooldown_end)
         else:
             logging.error(
@@ -494,8 +493,15 @@ def main(args):
                 "epoch": completed_epoch,
                 "name": args.name,
                 "state_dict": original_model.state_dict(),
-                "optimizer": optimizer.state_dict(),
             }
+            if args.use_adversary:
+                checkpoint_dict["optimizer"] = {
+                    "main": optimizer['main'].state_dict(),
+                    "adversary": optimizer['adversary'].state_dict(),
+                }
+            else:
+                 checkpoint_dict["optimizer"] = optimizer['main'].state_dict()
+
             if scaler is not None:
                 checkpoint_dict["scaler"] = scaler.state_dict()
 

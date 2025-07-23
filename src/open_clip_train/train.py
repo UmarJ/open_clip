@@ -182,6 +182,8 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     if hasattr(args, 'use_adversary') and args.use_adversary:
                         adversary = unwrap_model(model).adversary
                         if adversary is not None:
+                            logging.info('THE ADVERSARY NOT NONE')
+
                             image_features = model_out["image_features"]
                             text_features = model_out["text_features"]
                             
@@ -203,6 +205,8 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                                 F.binary_cross_entropy_with_logits(pred_from_img_fool, labels_text) +
                                 F.binary_cross_entropy_with_logits(pred_from_text_fool, labels_img)
                             ) / 2
+                        else:
+                            logging.info('THE ADVERSARY NONE')
 
                     inputs_no_accum = {}
                     inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")

@@ -475,7 +475,16 @@ def parse_args(args):
         type=str,
         help='A string to specify a specific distributed loss implementation.'
     )
-
+    parser.add_argument(
+        "--use-adversary",
+        default=False,
+        action="store_true",
+    )
+    parser.add_argument(
+        "--adversarial-loss-weight",
+        type=float,
+        default=1.0,
+    )
     args = parser.parse_args(args)
 
     if 'timm' not in args.opt:

@@ -220,6 +220,9 @@ def main(args):
     if args.siglip:
         model_kwargs['init_logit_scale'] = np.log(10)  # different from CLIP
         model_kwargs['init_logit_bias'] = -10
+    if args.use_adversary:
+        model_kwargs['use_adversary'] = args.use_adversary
+        model_kwargs['adversarial_loss_weight'] = args.adversarial_loss_weight
     model, preprocess_train, preprocess_val = create_model_and_transforms(
         args.model,
         args.pretrained,

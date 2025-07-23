@@ -271,6 +271,11 @@ class CLIP(nn.Module):
         else:
             self.logit_bias = None
         
+        if use_adversary:
+            logging.info('INITIALIZING ADVERSARY')
+        else:
+            logging.info('NOT INITIALIZING ADVERSARY')
+        
         self.adversary = FeatureAdversary(embed_dim) if use_adversary else None
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):

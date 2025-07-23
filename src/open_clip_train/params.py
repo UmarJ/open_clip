@@ -485,6 +485,12 @@ def parse_args(args):
         type=float,
         default=1.0,
     )
+    parser.add_argument(
+        "--adversary-lr",
+        type=float,
+        default=0.01,
+    )
+
     args = parser.parse_args(args)
 
     if 'timm' not in args.opt:

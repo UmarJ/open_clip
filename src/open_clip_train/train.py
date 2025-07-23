@@ -338,6 +338,8 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
         # all_image_features @ all_text_features will blow up memory and compute very quickly
         cumulative_loss = 0.0
         cumulative_gen_loss = 0.0
+        cumulative_adversary_loss = 0.0
+        total_adversary_correct = 0
         all_image_features, all_text_features = [], []
         with torch.inference_mode():
             for i, batch in enumerate(dataloader):
@@ -367,6 +369,28 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
 
                     gen_loss = maybe_compute_generative_loss(model_out)
 
+                    if hasattr(args, 'use_adversary') and args.use_adversary and unwrap_model(model).adversary is not None:
+                        adversary = unwrap_model(model).adversary
+                        pred_from_img = adversary(image_features).squeeze(-1)
+                        pred_from_text = adversary(text_features).squeeze(-1)
+
+                        labels_img = torch.ones_like(pred_from_img)
+                        labels_text = torch.zeros_like(pred_from_text)
+
+                        adversary_loss = (
+                            F.binary_cross_entropy_with_logits(pred_from_img, labels_img) +
+                            F.binary_cross_entropy_with_logits(pred_from_text, labels_text)
+                        ) / 2
+
+                        preds_img = (pred_from_img > 0).float()
+                        preds_text = (pred_from_text > 0).float()
+
+                        correct_img = (preds_img == labels_img).sum()
+                        correct_text = (preds_text == labels_text).sum()
+
+                        cumulative_adversary_loss += adversary_loss.item() * batch_size
+                        total_adversary_correct += correct_img.item() + correct_text.item()
+
                 cumulative_loss += total_loss * batch_size
                 num_samples += batch_size
                 if is_master(args) and (i % 100) == 0:
@@ -391,6 +415,14 @@ def evaluate(model, data, epoch, args, tb_writer=None, tokenizer=None):
             if gen_loss is not None:
                 gen_loss = cumulative_gen_loss / num_samples
                 metrics.update({"val_generative_loss": gen_loss.item()})
+
+            if hasattr(args, 'use_adversary') and args.use_adversary and unwrap_model(model).adversary is not None:
+                adversary_val_loss = cumulative_adversary_loss / num_samples
+                adversary_accuracy = total_adversary_correct / (2 * num_samples)
+                metrics.update({
+                    "adversary_val_loss": adversary_val_loss,
+                    "adversary_val_accuracy": adversary_accuracy,
+                })
 
     if not metrics:
         return metrics

@@ -219,6 +219,19 @@ def _build_text_tower(
     return text
 
 
+class FeatureAdversary(nn.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim // 2, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class CLIP(nn.Module):
     output_dict: torch.jit.Final[bool]
 
@@ -233,6 +246,7 @@ class CLIP(nn.Module):
             nonscalar_logit_scale: bool = False,
             cast_dtype: Optional[torch.dtype] = None,
             output_dict: bool = False,
+            use_adversary: bool = False,
     ):
         super().__init__()
         self.output_dict = output_dict
@@ -256,6 +270,8 @@ class CLIP(nn.Module):
             self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
         else:
             self.logit_bias = None
+        
+        self.adversary = FeatureAdversary(embed_dim) if use_adversary else None
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
@@ -445,6 +461,7 @@ class CustomTextCLIP(nn.Module):
             nonscalar_logit_scale: bool = False,
             cast_dtype: Optional[torch.dtype] = None,
             output_dict: bool = False,
+            use_adversary: bool = False,
     ):
         super().__init__()
         self.output_dict = output_dict
@@ -459,6 +476,8 @@ class CustomTextCLIP(nn.Module):
             self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
         else:
             self.logit_bias = None
+        
+        self.adversary = FeatureAdversary(embed_dim) if use_adversary else None
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
         # lock image tower as per LiT - https://arxiv.org/abs/2111.07991

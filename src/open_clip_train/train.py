@@ -104,9 +104,43 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     with torch.no_grad():
                         dist_model_out = dist_model(images, texts)
                     model_out.update({f'dist_{k}': v for k, v in dist_model_out.items()})
+
+                adversary_loss = None
+                fooling_loss = None
+                if hasattr(args, 'use_adversary') and args.use_adversary:
+                    adversary = unwrap_model(model).adversary
+                    if adversary is not None:
+                        image_features = model_out["image_features"]
+                        text_features = model_out["text_features"]
+                        
+                        pred_from_img = adversary(image_features.detach()).squeeze(-1)
+                        pred_from_text = adversary(text_features.detach()).squeeze(-1)
+                        
+                        labels_img = torch.ones_like(pred_from_img)
+                        labels_text = torch.zeros_like(pred_from_text)
+                        
+                        adversary_loss = (
+                            F.binary_cross_entropy_with_logits(pred_from_img, labels_img) +
+                            F.binary_cross_entropy_with_logits(pred_from_text, labels_text)
+                        ) / 2
+
+                        pred_from_img_fool = adversary(image_features).squeeze(-1)
+                        pred_from_text_fool = adversary(text_features).squeeze(-1)
+
+                        fooling_loss = (
+                            F.binary_cross_entropy_with_logits(pred_from_img_fool, labels_text) +
+                            F.binary_cross_entropy_with_logits(pred_from_text_fool, labels_img)
+                        ) / 2
+
                 losses = loss(**model_out, output_dict=True)
 
                 total_loss = sum(losses.values())
+                if adversary_loss is not None and fooling_loss is not None:
+                    if not hasattr(args, 'adversarial_loss_weight'):
+                        args.adversarial_loss_weight = 1.0
+                    losses['adversary_loss'] = adversary_loss
+                    losses['fooling_loss'] = fooling_loss
+                    total_loss += adversary_loss + args.adversarial_loss_weight * fooling_loss
                 losses["loss"] = total_loss
 
             backward(total_loss, scaler)
@@ -142,6 +176,33 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                 texts = accum_texts[j]
                 with autocast():
                     model_out = model(images, texts)
+                    
+                    adversary_loss = None
+                    fooling_loss = None
+                    if hasattr(args, 'use_adversary') and args.use_adversary:
+                        adversary = unwrap_model(model).adversary
+                        if adversary is not None:
+                            image_features = model_out["image_features"]
+                            text_features = model_out["text_features"]
+                            
+                            pred_from_img = adversary(image_features.detach()).squeeze(-1)
+                            pred_from_text = adversary(text_features.detach()).squeeze(-1)
+                            
+                            labels_img = torch.ones_like(pred_from_img)
+                            labels_text = torch.zeros_like(pred_from_text)
+                            
+                            adversary_loss = (
+                                F.binary_cross_entropy_with_logits(pred_from_img, labels_img) +
+                                F.binary_cross_entropy_with_logits(pred_from_text, labels_text)
+                            ) / 2
+
+                            pred_from_img_fool = adversary(image_features).squeeze(-1)
+                            pred_from_text_fool = adversary(text_features).squeeze(-1)
+
+                            fooling_loss = (
+                                F.binary_cross_entropy_with_logits(pred_from_img_fool, labels_text) +
+                                F.binary_cross_entropy_with_logits(pred_from_text_fool, labels_img)
+                            ) / 2
 
                     inputs_no_accum = {}
                     inputs_no_accum["logit_scale"] = logit_scale = model_out.pop("logit_scale")
@@ -156,7 +217,14 @@ def train_one_epoch(model, data, loss, epoch, optimizer, scaler, scheduler, dist
                     losses = loss(**inputs, **inputs_no_accum, output_dict=True)
                     del inputs
                     del inputs_no_accum
+
                     total_loss = sum(losses.values())
+                    if adversary_loss is not None and fooling_loss is not None:
+                        if not hasattr(args, 'adversarial_loss_weight'):
+                            args.adversarial_loss_weight = 1.0
+                        losses['adversary_loss'] = adversary_loss
+                        losses['fooling_loss'] = fooling_loss
+                        total_loss += adversary_loss + args.adversarial_loss_weight * fooling_loss
                     losses["loss"] = total_loss
 
                 backward(total_loss, scaler)
